@@ -1,38 +1,18 @@
-"""
-recommender.py — Content-based movie recommender.
-
-Pipeline:
-  1. TF-IDF vectorise each movie's "content soup" (genres x2 + keywords + cast +
-     director + overview).
-  2. For a query we either (a) rank by cosine similarity to a seed movie
-     ("more like that"), (b) rank by similarity to a free-text query, or
-     (c) hard-filter by requested genre/mood/era/rating and rank by a Bayesian
-     quality prior. Results are explainable and de-duplicated against the
-     session's already-seen titles (supports the 'refine' intent).
-
-Evaluation: genre Precision@K, mood-appropriateness@K, and NDCG@K against a
-genre-membership relevance signal — a real, honest metric (the prior repo
-shipped none).
-"""
 from __future__ import annotations
-import os as _os
-_DATA_DIR = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "data")
+import os
 import numpy as np
 import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+import chromadb
+from chromadb.utils import embedding_functions
 
-import sys, os
+import sys
 sys.path.append(os.path.dirname(__file__))
 from data_prep import MOOD_TO_GENRES
 
-
-class MovieRecommender:
-    def __init__(self, movies: pd.DataFrame):
+class VectorRecommender:
+    def __init__(self, movies: pd.DataFrame, db_path="./chroma_db"):
         self.m = movies.reset_index(drop=True)
-        self.vec = TfidfVectorizer(max_features=20000, ngram_range=(1, 2),
-                                   min_df=2, stop_words="english")
-        self.X = self.vec.fit_transform(self.m["content"])
+        
         # Bayesian weighted rating (IMDB formula) as a quality prior.
         C = self.m["vote_average"].mean()
         mvotes = self.m["vote_count"].quantile(0.60)
@@ -40,9 +20,42 @@ class MovieRecommender:
         self.m["wr"] = (v / (v + mvotes)) * R + (mvotes / (v + mvotes)) * C
         self.title_to_idx = {t: i for i, t in enumerate(self.m["original_title"])}
 
-    # ---- helpers ----------------------------------------------------------
+        # Initialize ChromaDB
+        self.client = chromadb.PersistentClient(path=db_path)
+        # Using the default all-MiniLM-L6-v2 which is highly efficient for semantic search
+        self.emb_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+        self.collection = self.client.get_or_create_collection(
+            name="movies",
+            embedding_function=self.emb_fn
+        )
+        self.build_index()
+
+    def build_index(self):
+        if self.collection.count() > 0:
+            return
+        
+        print("Building Chroma vector index... this will take a few moments.")
+        batch_size = 250
+        for i in range(0, len(self.m), batch_size):
+            batch = self.m.iloc[i:i+batch_size]
+            
+            ids = [str(idx) for idx in batch.index]
+            # Embed the 'content soup' which includes genres, keywords, cast, overview
+            documents = batch["content"].tolist()
+            metadatas = []
+            
+            for _, row in batch.iterrows():
+                metadatas.append({
+                    "title": str(row["original_title"]),
+                    "year": int(row["release_year"]) if pd.notna(row["release_year"]) else 0,
+                    "rating": float(row["vote_average"]) if pd.notna(row["vote_average"]) else 0.0,
+                    "era": str(row["era"])
+                })
+                
+            self.collection.add(ids=ids, documents=documents, metadatas=metadatas)
+        print(f"Indexed {self.collection.count()} movies successfully.")
+
     def _requested_genres(self, slots):
-        """Explicit genre wins the hard filter; mood only broadens if no genre."""
         explicit = set(slots.get("genre") or [])
         if explicit:
             return explicit
@@ -65,9 +78,7 @@ class MovieRecommender:
                 start = int(e[:-1]); mask |= (yr >= start) & (yr <= start + 9)
         return mask
 
-    # ---- main entry point -------------------------------------------------
-    def recommend(self, slots=None, query_text=None, seed_title=None,
-                  exclude=None, k=5):
+    def recommend(self, slots=None, query_text=None, seed_title=None, exclude=None, k=5):
         slots = slots or {}
         exclude = set(exclude or [])
         genres = self._requested_genres(slots)
@@ -75,33 +86,74 @@ class MovieRecommender:
         # Candidate mask: era + rating + genre hard filters.
         mask = self._era_mask(slots.get("era")).copy()
         if slots.get("min_rating"):
-            mask &= (self.m["vote_average"] >= slots["min_rating"]).to_numpy()
+            mask &= (self.m["vote_average"] >= slots.get("min_rating")).to_numpy()
         if genres:
             gmask = self.m["genre_list"].apply(
                 lambda gl: bool(set(gl) & genres)).to_numpy()
             mask &= gmask
+        
         cand = np.where(mask)[0]
-        if len(cand) == 0:                      # relax genre filter if too strict
+        if len(cand) == 0:
             cand = np.where(self._era_mask(slots.get("era")))[0]
         if len(cand) == 0:
             cand = np.arange(len(self.m))
 
-        # Scoring signal.
+        score = np.zeros(len(self.m))
+        
+        # 1. Base score is normalized WR (quality prior)
+        wr_norm = _minmax(self.m["wr"].values)
+        
         if seed_title and seed_title in self.title_to_idx:
-            sim = cosine_similarity(self.X[self.title_to_idx[seed_title]],
-                                    self.X[cand]).ravel()
-            score = 0.7 * sim + 0.3 * _minmax(self.m["wr"].values[cand])
-        elif query_text:
-            qv = self.vec.transform([query_text.lower()])
-            sim = cosine_similarity(qv, self.X[cand]).ravel()
-            score = 0.6 * sim + 0.4 * _minmax(self.m["wr"].values[cand])
+            # Semantic search using seed movie content
+            seed_idx = self.title_to_idx[seed_title]
+            query_content = self.m["content"].iloc[seed_idx]
+            
+            # Query ChromaDB.
+            results = self.collection.query(
+                query_texts=[query_content],
+                n_results=min(100, len(self.m)),
+                include=["distances"]
+            )
+            # distances are typically L2 distance. lower is better. We convert to similarity
+            for c_id, dist in zip(results["ids"][0], results["distances"][0]):
+                idx = int(c_id)
+                score[idx] += 0.7 * (1.0 / (1.0 + dist))
+                
+            score += 0.3 * wr_norm
+            
+        elif query_text or slots.get("mood") or slots.get("genre"):
+            # Construct a semantic query
+            parts = []
+            if query_text: parts.append(query_text)
+            if slots.get("mood"): parts.append(" ".join(slots["mood"]))
+            if slots.get("genre"): parts.append(" ".join(slots["genre"]))
+            
+            search_str = " ".join(parts)
+            
+            if search_str.strip():
+                results = self.collection.query(
+                    query_texts=[search_str],
+                    n_results=min(200, len(self.m)),
+                    include=["distances"]
+                )
+                for c_id, dist in zip(results["ids"][0], results["distances"][0]):
+                    idx = int(c_id)
+                    score[idx] += 0.6 * (1.0 / (1.0 + dist))
+                
+            score += 0.4 * wr_norm
         else:
-            # genre/mood-only query -> rank by quality within the filtered pool.
-            score = _minmax(self.m["wr"].values[cand])
-
-        order = cand[np.argsort(-score)]
+            score = wr_norm
+            
+        # Apply mask
+        masked_score = np.full(len(self.m), -1.0)
+        masked_score[cand] = score[cand]
+        
+        order = np.argsort(-masked_score)
+        
         out = []
         for i in order:
+            if masked_score[i] < 0:
+                break
             title = self.m["original_title"].iat[i]
             if title in exclude:
                 continue
@@ -128,16 +180,12 @@ class MovieRecommender:
             "why": "; ".join(reasons),
         }
 
-
 def _minmax(a):
     a = np.asarray(a, dtype=float)
     lo, hi = a.min(), a.max()
     return (a - lo) / (hi - lo + 1e-9)
 
-
-# ---- Evaluation -----------------------------------------------------------
-def evaluate(reco: MovieRecommender, k=5):
-    """Genre Precision@K + mood-appropriateness@K + NDCG@K (genre relevance)."""
+def evaluate(reco: VectorRecommender, k=5):
     genres = ["Action", "Comedy", "Drama", "Horror", "Thriller", "Romance",
               "Science Fiction", "Animation", "Adventure", "Crime", "Mystery",
               "Family", "Fantasy"]
@@ -159,8 +207,6 @@ def evaluate(reco: MovieRecommender, k=5):
         rel = [1 if set(r["genres"]) & target else 0 for r in recs]
         mood_scores.append(np.mean(rel))
 
-    # Non-trivial signal: for "more like X", how genre-coherent are neighbours?
-    # (Jaccard genre overlap between each seed and its top-k similar movies.)
     seeds = ["Inception", "Toy Story", "The Godfather", "Titanic", "Alien",
              "The Hangover", "Gladiator", "Finding Nemo"]
     coh = []
@@ -180,11 +226,16 @@ def evaluate(reco: MovieRecommender, k=5):
         "similar_genre_coherence@%d" % k: round(float(np.mean(coh)), 3),
     }
 
-
 if __name__ == "__main__":
     from data_prep import load_movies
-    movies = load_movies(_os.path.join(_DATA_DIR, "tmdb_movies.csv"))
-    reco = MovieRecommender(movies)
+    _DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    csv_path = os.path.join(_DATA_DIR, "tmdb_movies.csv")
+    if not os.path.exists(csv_path):
+        print(f"Error: {csv_path} not found. Ensure data is downloaded first.")
+        sys.exit(1)
+        
+    movies = load_movies(csv_path)
+    reco = VectorRecommender(movies)
     print("Catalogue:", len(movies), "movies\n")
 
     print(">> 'feel-good comedy from the 90s'")

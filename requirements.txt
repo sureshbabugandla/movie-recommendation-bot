@@ -1,13 +1,12 @@
-# CineBot — Python dependencies
-# Tested on Python 3.10–3.12
+# CineBot API — Python dependencies
+# Next-Gen Architecture (Vector Database + LLM)
 
-tensorflow-cpu>=2.15      # deep-learning intent model (use 'tensorflow' if you have a GPU)
-scikit-learn>=1.3         # TF-IDF, LinearSVC baseline, metrics, splits
 pandas>=2.0
 numpy>=1.24
-matplotlib>=3.7
-seaborn>=0.12
-
-# Only needed to run the notebook locally (already present on Colab):
-jupyter
-notebook
+sentence-transformers>=2.7.0
+chromadb>=0.5.0
+openai>=1.30.0
+pydantic>=2.7.0
+fastapi>=0.110.0
+uvicorn>=0.30.0
+python-dotenv>=1.0.0
